@@ -203,16 +203,20 @@ void enableSlowCLK()
 
     if (cal_32k == 0) {
         LOG_DEBUG("32k XTAL OSC has not started up");
-    } else {
-        rtc_clk_slow_freq_set(RTC_SLOW_FREQ_32K_XTAL);
-        LOG_DEBUG("RTC source now 32k XTAL");
-        CALIBRATE_ONE(RTC_CAL_RTC_MUX);
-        CALIBRATE_ONE(RTC_CAL_32K_XTAL);
+        // No crystal: power the amplifier back down and skip the remaining
+        // calibration rounds against a dead oscillator.
+        rtc_clk_32k_enable(false);
+        return;
     }
+    rtc_clk_slow_freq_set(RTC_SLOW_FREQ_32K_XTAL);
+    LOG_DEBUG("RTC source now 32k XTAL");
     CALIBRATE_ONE(RTC_CAL_RTC_MUX);
     CALIBRATE_ONE(RTC_CAL_32K_XTAL);
     if (rtc_clk_slow_freq_get() != RTC_SLOW_FREQ_32K_XTAL) {
         LOG_WARN("Failed to switch 32K XTAL RTC source to 32.768kHz !!! ");
+        // Power the XTAL32K amplifier back down: a board without a real crystal
+        // would otherwise keep it running against a dead oscillator forever.
+        rtc_clk_32k_enable(false);
         return;
     }
 }
