@@ -1,4 +1,4 @@
-#define VEXT_ENABLE 36 // active low, powers the oled display and the lora antenna boost
+#define VEXT_ENABLE 36 // active low, powers the oled display (the RF FEM rail is LORA_PA_POWER, GPIO7)
 #define BUTTON_PIN 0
 
 #define ADC_CTRL 37
@@ -9,6 +9,8 @@
 #define ADC_MULTIPLIER 4.9 * 1.045
 
 #define USE_SX1262
+
+#define HAS_ESP32_DYNAMIC_LIGHT_SLEEP_CAPABILITY 1
 
 #define LORA_DIO0 -1 // a No connect on the SX1262 module
 #define LORA_RESET 12
@@ -95,4 +97,3 @@
 // GNSS is on the V4 expansion kit (CM121, 9600 baud by default), not on the bare board
 #define GPS_TX_PIN (38) // This is for bits going TOWARDS the GPS
 #define GPS_RX_PIN (39) // This is for bits going TOWARDS the CPU
-#define GPS_THREAD_INTERVAL 50
