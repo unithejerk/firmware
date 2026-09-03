@@ -1247,6 +1247,12 @@ void setup()
     setCPUFast(false); // 80MHz is fine for our slow peripherals
 #endif
 
+#ifdef ARCH_ESP32
+    // esp_pm DFS on PM builds; auto light sleep when PowerFSM can reach stateLS.
+    // Must run after PowerFSM_setup() so wake sources are armed before PM starts idling between tasks.
+    initLightSleep();
+#endif
+
 #ifdef ARDUINO_ARCH_ESP32
     LOG_DEBUG("Free heap  : %7d bytes", ESP.getFreeHeap());
     LOG_DEBUG("Free PSRAM : %7d bytes", ESP.getFreePsram());

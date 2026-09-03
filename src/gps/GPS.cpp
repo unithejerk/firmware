@@ -1141,6 +1141,7 @@ GPS::~GPS()
 {
     // we really should unregister our sleep observer
     notifyDeepSleepObserver.unobserve(&notifyDeepSleep);
+    preflightSleepObserver.unobserve(&::preflightSleep);
 }
 
 // Put the GPS hardware into a specified state
@@ -1631,6 +1632,14 @@ int GPS::prepareDeepSleep(void *unused)
     return 0;
 }
 
+int GPS::preflightSleep(void *deepSleep)
+{
+    if (deepSleep != nullptr || config.position.gps_mode != meshtastic_Config_PositionConfig_GpsMode_ENABLED || !enabled)
+        return 0;
+
+    return !GPSInitFinished || powerState == GPS_ACTIVE;
+}
+
 static const char *PROBE_MESSAGE = "Trying %s (%s)...";
 static const char *DETECTED_MESSAGE = "%s detected";
 
@@ -2011,6 +2020,7 @@ std::unique_ptr<GPS> GPS::createGps()
 
     // Make sure the GPS is awake before performing any init.
     new_gps->up();
+    new_gps->preflightSleepObserver.observe(&::preflightSleep);
 
 #ifdef PIN_GPS_RESET
     pinMode(PIN_GPS_RESET, OUTPUT);

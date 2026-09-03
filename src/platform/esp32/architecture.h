@@ -263,6 +263,7 @@
 #endif
 
 // Setup flag, which indicates if our device supports dynamic light sleep
-#if defined(HAS_ESP32_PM_SUPPORT) && defined(CONFIG_FREERTOS_USE_TICKLESS_IDLE)
+#if defined(HAS_ESP32_DYNAMIC_LIGHT_SLEEP_CAPABILITY) && defined(HAS_ESP32_PM_SUPPORT) &&                                        \
+    defined(CONFIG_FREERTOS_USE_TICKLESS_IDLE) && defined(CONFIG_PM_LIGHT_SLEEP_CALLBACKS)
 #define HAS_ESP32_DYNAMIC_LIGHT_SLEEP 1
 #endif

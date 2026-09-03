@@ -85,6 +85,10 @@ struct ChipInfo {
  */
 class GPS : private concurrency::OSThread
 {
+#ifdef PIO_UNIT_TESTING
+    friend class GPSPreflightTestShim;
+#endif
+
   public:
     meshtastic_Position p = meshtastic_Position_init_default;
 
@@ -226,6 +230,7 @@ class GPS : private concurrency::OSThread
     uint8_t numSatellites = 0;
 
     CallbackObserver<GPS, void *> notifyDeepSleepObserver = CallbackObserver<GPS, void *>(this, &GPS::prepareDeepSleep);
+    CallbackObserver<GPS, void *> preflightSleepObserver = CallbackObserver<GPS, void *>(this, &GPS::preflightSleep);
 
     /** If !NULL we will use this serial port to construct our GPS */
 #if defined(SENSECAP_INDICATOR)
@@ -256,6 +261,7 @@ class GPS : private concurrency::OSThread
     /// Prepare the GPS for the cpu entering deep sleep, expect to be gone for at least 100s of msecs
     /// always returns 0 to indicate okay to sleep
     int prepareDeepSleep(void *unused);
+    int preflightSleep(void *deepSleep);
 
     /** Set power with EN pin, if relevant
      */

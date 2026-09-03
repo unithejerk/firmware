@@ -59,6 +59,14 @@ class SerialConsole : public StreamAPI, public RedirectablePrint, private concur
     virtual bool writeFrame(uint8_t *buf, size_t len, bool bestEffort) override;
 
   private:
+#if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT
+    /// Veto automatic light sleep while a USB CDC host is active.
+    int preflightSleep(void *deepSleep);
+
+    CallbackObserver<SerialConsole, void *> preflightSleepObserver =
+        CallbackObserver<SerialConsole, void *>(this, &SerialConsole::preflightSleep);
+#endif
+
     /// On USB CDC targets, keep console TX non-blocking unless a host is draining the
     /// port, so a dead host can't stall the main loop and trip the task watchdog.
     void setHostDraining(bool draining);

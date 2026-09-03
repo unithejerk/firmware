@@ -12,9 +12,11 @@
 #include "MeshService.h"
 #include "NodeDB.h"
 #include "PowerMon.h"
+#include "UptimeClock.h"
 #include "configuration.h"
 #include "graphics/Screen.h"
 #include "main.h"
+#include "mesh/Throttle.h"
 #include "modules/StatusLEDModule.h"
 #include "sleep.h"
 #include "target_specific.h"
@@ -110,6 +112,12 @@ static void shutdownEnter()
 #include "error.h"
 
 static uint32_t secsSlept;
+#ifdef ARCH_ESP32
+#if HAS_ESP32_DYNAMIC_LIGHT_SLEEP
+static uint32_t lsIdleSinceMsec;
+static bool lsAutoSleepEnabled;
+#endif
+#endif
 
 static void lsEnter()
 {
@@ -118,7 +126,10 @@ static void lsEnter()
         screen->setOn(false);
     t5BacklightOffForSleep();
     secsSlept = 0; // How long have we been sleeping this time
-
+#if defined(ARCH_ESP32) && HAS_ESP32_DYNAMIC_LIGHT_SLEEP
+    lsIdleSinceMsec = Time::getMillis();
+    lsAutoSleepEnabled = false;
+#endif
     // LOG_INFO("lsEnter end");
 }
 
@@ -128,6 +139,46 @@ static void lsIdle()
 
 #ifdef ARCH_ESP32
 
+#if HAS_ESP32_DYNAMIC_LIGHT_SLEEP
+    if (consumeAutoLightSleepButtonWake()) {
+        powerFSM.trigger(EVENT_PRESS);
+        return;
+    }
+
+    // Do we have more sleeping to do? Check before the preflight veto: a chronic
+    // blocker must not pin LS forever while esp_pm keeps sleeping underneath.
+    const uint32_t lsDurationMsec = Default::getConfiguredOrDefaultMs(config.power.ls_secs, default_ls_secs);
+    if (Throttle::hasElapsed(lsIdleSinceMsec, lsDurationMsec)) {
+        LOG_INFO("Reached ls_secs, service loop()");
+        powerFSM.trigger(EVENT_WAKE_TIMER);
+        return;
+    }
+
+    if (!doPreflightSleep()) {
+        if (lsAutoSleepEnabled) {
+            if (stopAutoLightSleep()) {
+                lsAutoSleepEnabled = false;
+                powerMon->clearState(meshtastic_PowerMon_State_CPU_LightSleep);
+                statusLEDModule->setPowerLED(true);
+            }
+        }
+        return;
+    }
+
+    if (!lsAutoSleepEnabled) {
+        if (!isDynamicLightSleepReady()) {
+            powerFSM.trigger(EVENT_WAKE_TIMER);
+            return;
+        }
+        if (!startAutoLightSleep()) {
+            powerFSM.trigger(EVENT_WAKE_TIMER);
+            return;
+        }
+        powerMon->setState(meshtastic_PowerMon_State_CPU_LightSleep);
+        statusLEDModule->setPowerLED(false);
+        lsAutoSleepEnabled = true;
+    }
+#else
     // Do we have more sleeping to do?
     if (secsSlept < config.power.ls_secs) {
         // If some other service would stall sleep, don't let sleep happen yet
@@ -137,7 +188,7 @@ static void lsIdle()
 
             powerMon->setState(meshtastic_PowerMon_State_CPU_LightSleep);
             statusLEDModule->setPowerLED(false);
-            esp_sleep_source_t wakeCause2 = doLightSleep(sleepTime * 1000LL);
+            esp_sleep_wakeup_cause_t wakeCause2 = doLightSleep(sleepTime * 1000LL);
             powerMon->clearState(meshtastic_PowerMon_State_CPU_LightSleep);
 
             switch (wakeCause2) {
@@ -157,13 +208,7 @@ static void lsIdle()
                 break;
 
             case ESP_SLEEP_WAKEUP_GPIO: {
-                bool pressed = false;
-#if defined(BUTTON_PIN)
-                pressed = !digitalRead(config.device.button_gpio ? config.device.button_gpio : BUTTON_PIN);
-#elif defined(KB_INT)
-                // keyboard press (probably) triggered GPIO interrupt
-                pressed = true;
-#endif
+                bool pressed = didWakeFromAutoLightSleepInput(wakeCause2);
                 if (pressed) {
                     powerFSM.trigger(EVENT_PRESS);
                 }
@@ -193,11 +238,23 @@ static void lsIdle()
         powerFSM.trigger(EVENT_WAKE_TIMER);
     }
 #endif
+#endif
 }
 
 static void lsExit()
 {
     LOG_POWERFSM("State: lsExit");
+#if defined(ARCH_ESP32) && HAS_ESP32_DYNAMIC_LIGHT_SLEEP
+    // Re-acquire the NO_LIGHT_SLEEP lock so PM stops auto-sleeping.
+    const bool autoSleepStopped = stopAutoLightSleep();
+    if (!autoSleepStopped) {
+        LOG_ERROR("Unable to stop PM dynamic light sleep");
+    } else {
+        lsAutoSleepEnabled = false;
+        powerMon->clearState(meshtastic_PowerMon_State_CPU_LightSleep);
+        statusLEDModule->setPowerLED(true);
+    }
+#endif
     // Lift the light-sleep force-off gate when leaving LS.
     t5BacklightWakeFromSleep();
 }
@@ -382,6 +439,7 @@ void PowerFSM_setup()
                             "Input Device"); // restarts the sleep timer
 
     powerFSM.add_transition(&stateDARK, &stateON, EVENT_BLUETOOTH_PAIR, NULL, "Bluetooth pairing");
+    powerFSM.add_transition(&stateLS, &stateON, EVENT_BLUETOOTH_PAIR, NULL, "Bluetooth pairing");
     powerFSM.add_transition(&stateON, &stateON, EVENT_BLUETOOTH_PAIR, NULL, "Bluetooth pairing");
 
     // if we are a router we don't turn the screen on for these things

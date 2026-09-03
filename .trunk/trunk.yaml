@@ -167,6 +167,10 @@ lint:
     - linters: [ALL]
       paths:
         - .github/nightly/*.html
+    # Lob misidentifies the preflight observer test names as credentials.
+    - linters: [trufflehog]
+      paths:
+        - test/test_preflight_sleep/test_main.cpp
 runtimes:
   enabled:
     - python@3.14.4

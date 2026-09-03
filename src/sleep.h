@@ -8,7 +8,22 @@ void doDeepSleep(uint32_t msecToWake, bool skipPreflight, bool skipSaveNodeDb), 
 
 #ifdef ARCH_ESP32
 #include "esp_sleep.h"
-esp_sleep_wakeup_cause_t doLightSleep(uint64_t msecToWake);
+
+/// Explicit timed light sleep of that many ms (legacy PowerFSM stateLS loop on
+/// non-tickless builds). Returns the wake cause.
+esp_sleep_wakeup_cause_t doLightSleep(uint32_t msecToWake);
+
+/// Let esp_pm auto light-sleep between tasks (releases the NO_LIGHT_SLEEP lock).
+/// Returns false if the PM wake path could not be armed or released.
+bool startAutoLightSleep();
+
+/// Stop automatic light sleep (re-acquires the NO_LIGHT_SLEEP lock; PM idles the
+/// CPU at min_freq but never auto-sleeps until startAutoLightSleep() again).
+bool stopAutoLightSleep();
+
+/// Consume a button GPIO wake recorded by the esp_pm light-sleep exit callback.
+bool consumeAutoLightSleepButtonWake();
+bool didWakeFromAutoLightSleepInput(esp_sleep_wakeup_cause_t cause);
 
 extern esp_sleep_source_t wakeCause;
 #endif
@@ -58,8 +73,14 @@ extern Observable<void *> notifyLightSleep;
 extern Observable<esp_sleep_wakeup_cause_t> notifyLightSleepEnd;
 #endif
 
-void enableModemSleep();
 #ifdef ARCH_ESP32
+/// Configure esp_pm DFS on every PM build; enable auto light sleep when
+/// PowerFSM can reach stateLS (isRouter || config.power.is_power_saving).
+/// Auto light sleep stays blocked until PowerFSM calls startAutoLightSleep().
+void initLightSleep();
+bool isDynamicLightSleepReady();
 void enableLoraInterrupt();
+/// Arm the button (and other user-input) wake sources, including BUTTON_NEED_PULLUP.
+void enableButtonInterrupt();
 bool shouldLoraWake(uint32_t msecToWake);
 #endif

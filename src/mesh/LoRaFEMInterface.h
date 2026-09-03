@@ -15,6 +15,7 @@ class LoRaFEMInterface
     void setTxModeEnable(void);
     void setRxModeEnable(void);
     void setRxModeEnableWhenMCUSleep(void);
+    void releaseSleepHolds(void);
     void setLNAEnable(bool enabled);
     int8_t powerConversion(int8_t loraOutputPower);
     bool isLnaCanControl(void) { return lna_can_control; }

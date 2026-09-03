@@ -37,9 +37,11 @@ static void releasePinHold(int pin)
         gpio_hold_dis(gpio);
     }
 }
+#endif
 
-static void releaseSleepHolds()
+void LoRaFEMInterface::releaseSleepHolds(void)
 {
+#if defined(ARCH_ESP32)
     releasePinHold(LORA_PA_POWER);
 #ifdef HELTEC_V4
     releasePinHold(LORA_KCT8103L_PA_CSD);
@@ -51,8 +53,8 @@ static void releaseSleepHolds()
     releasePinHold(LORA_KCT8103L_PA_CSD);
     releasePinHold(LORA_KCT8103L_PA_CTX);
 #endif
-}
 #endif
+}
 
 void LoRaFEMInterface::init(void)
 {
@@ -136,9 +138,7 @@ void LoRaFEMInterface::init(void)
 
 void LoRaFEMInterface::setSleepModeEnable(void)
 {
-#if defined(ARCH_ESP32)
     releaseSleepHolds();
-#endif
 
 #ifdef HELTEC_V4
     if (fem_type == GC1109_PA) {
@@ -168,9 +168,7 @@ void LoRaFEMInterface::setSleepModeEnable(void)
 
 void LoRaFEMInterface::setTxModeEnable(void)
 {
-#if defined(ARCH_ESP32)
     releaseSleepHolds();
-#endif
 
 #ifdef HELTEC_V4
     if (fem_type == GC1109_PA) {
@@ -196,9 +194,7 @@ void LoRaFEMInterface::setTxModeEnable(void)
 
 void LoRaFEMInterface::setRxModeEnable(void)
 {
-#if defined(ARCH_ESP32)
     releaseSleepHolds();
-#endif
 
 #ifdef HELTEC_V4
     if (fem_type == GC1109_PA) {
@@ -232,9 +228,7 @@ void LoRaFEMInterface::setRxModeEnable(void)
 
 void LoRaFEMInterface::setRxModeEnableWhenMCUSleep(void)
 {
-#if defined(ARCH_ESP32)
     releaseSleepHolds();
-#endif
 
 #ifdef HELTEC_V4
     // Keep FEM rail powered during deep sleep so LoRa RX wake can work (GC1109 keeps LNA active; KCT8103L uses RX bypass).
