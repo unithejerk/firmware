@@ -2020,7 +2020,10 @@ std::unique_ptr<GPS> GPS::createGps()
 
     // Make sure the GPS is awake before performing any init.
     new_gps->up();
+#if HAS_ESP32_DYNAMIC_LIGHT_SLEEP
+    // Keep the CPU awake while the GPS is active when automatic light sleep is enabled.
     new_gps->preflightSleepObserver.observe(&::preflightSleep);
+#endif
 
 #ifdef PIN_GPS_RESET
     pinMode(PIN_GPS_RESET, OUTPUT);

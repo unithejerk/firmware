@@ -9,7 +9,6 @@
 #include "Throttle.h"
 #include "concurrency/LockGuard.h"
 #include "main.h"
-#include "sleep.h"
 #include "time.h"
 
 #if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT
@@ -33,34 +32,6 @@
 #define SERIAL_CONNECTION_TIMEOUT (15 * 60) * 1000UL
 
 SerialConsole *console;
-
-// esp_pm NO_LIGHT_SLEEP lock held while a USB host link is live, so PM auto light sleep
-// can't drop CDC RX bytes. Release/acquire is idempotent for repeat edges. ESP32 PM builds only.
-#ifdef ARCH_ESP32
-#if HAS_ESP32_PM_SUPPORT
-#include "esp_pm.h"
-static esp_pm_lock_handle_t s_consolePmLock = nullptr;
-static void setConsolePmLock(bool hold)
-{
-    if (s_consolePmLock == nullptr && hold) {
-        if (esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "usbcdc", &s_consolePmLock) != ESP_OK)
-            s_consolePmLock = nullptr;
-    }
-    if (s_consolePmLock == nullptr)
-        return;
-    static bool s_held = false;
-    if (hold != s_held) {
-        hold ? esp_pm_lock_acquire(s_consolePmLock) : esp_pm_lock_release(s_consolePmLock);
-        s_held = hold;
-    }
-}
-
-#else
-static void setConsolePmLock(bool) {}
-#endif
-#else
-static void setConsolePmLock(bool) {}
-#endif
 
 #ifdef IS_USB_SERIAL
 static void onConsoleCdcEvent(void *, esp_event_base_t, int32_t, void *)
@@ -111,7 +82,6 @@ SerialConsole::SerialConsole() : StreamAPI(&Port), RedirectablePrint(&Port), con
 #endif
     Port.begin(SERIAL_BAUD);
 #ifdef IS_USB_SERIAL
-    preflightSleepObserver.observe(&::preflightSleep);
     Port.onEvent(ARDUINO_HW_CDC_RX_EVENT, onConsoleCdcEvent);
     Port.onEvent(ARDUINO_HW_CDC_CONNECTED_EVENT, onConsoleCdcEvent);
 #endif
@@ -173,9 +143,7 @@ int32_t SerialConsole::runOnce()
         return delay < 25 ? delay : 25; // 0 continues a budget slice; else short-poll TX drain
     return Port.available() ? delay : INT32_MAX;
 #elif defined(IS_USB_SERIAL)
-    const bool plugged = HWCDC::isPlugged();
-    setConsolePmLock(plugged);
-    return plugged ? delay : (1000 * 20);
+    return HWCDC::isPlugged() ? delay : (1000 * 20);
 #else
     return delay;
 #endif
@@ -221,13 +189,6 @@ bool SerialConsole::checkIsConnected()
 {
     return Throttle::isWithinTimespanMs(lastContactMsec, SERIAL_CONNECTION_TIMEOUT);
 }
-
-#ifdef IS_USB_SERIAL
-int SerialConsole::preflightSleep(void *deepSleep)
-{
-    return deepSleep == nullptr && HWCDC::isPlugged() ? 1 : 0;
-}
-#endif
 
 /// Select bounded or non-blocking HWCDC writes based on host liveness.
 void SerialConsole::setHostDraining(bool draining)

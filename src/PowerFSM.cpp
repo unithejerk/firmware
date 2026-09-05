@@ -12,11 +12,11 @@
 #include "MeshService.h"
 #include "NodeDB.h"
 #include "PowerMon.h"
+#include "Throttle.h"
 #include "UptimeClock.h"
 #include "configuration.h"
 #include "graphics/Screen.h"
 #include "main.h"
-#include "mesh/Throttle.h"
 #include "modules/StatusLEDModule.h"
 #include "sleep.h"
 #include "target_specific.h"
@@ -145,8 +145,7 @@ static void lsIdle()
         return;
     }
 
-    // Do we have more sleeping to do? Check before the preflight veto: a chronic
-    // blocker must not pin LS forever while esp_pm keeps sleeping underneath.
+    // Check the timeout before preflight so a persistent veto cannot keep us in LS.
     const uint32_t lsDurationMsec = Default::getConfiguredOrDefaultMs(config.power.ls_secs, default_ls_secs);
     if (Throttle::hasElapsed(lsIdleSinceMsec, lsDurationMsec)) {
         LOG_INFO("Reached ls_secs, service loop()");
@@ -208,7 +207,13 @@ static void lsIdle()
                 break;
 
             case ESP_SLEEP_WAKEUP_GPIO: {
-                bool pressed = didWakeFromAutoLightSleepInput(wakeCause2);
+                bool pressed = false;
+#if defined(BUTTON_PIN)
+                pressed = !digitalRead(config.device.button_gpio ? config.device.button_gpio : BUTTON_PIN);
+#elif defined(KB_INT)
+                // keyboard press (probably) triggered GPIO interrupt
+                pressed = true;
+#endif
                 if (pressed) {
                     powerFSM.trigger(EVENT_PRESS);
                 }
@@ -246,13 +251,15 @@ static void lsExit()
     LOG_POWERFSM("State: lsExit");
 #if defined(ARCH_ESP32) && HAS_ESP32_DYNAMIC_LIGHT_SLEEP
     // Re-acquire the NO_LIGHT_SLEEP lock so PM stops auto-sleeping.
-    const bool autoSleepStopped = stopAutoLightSleep();
-    if (!autoSleepStopped) {
-        LOG_ERROR("Unable to stop PM dynamic light sleep");
-    } else {
-        lsAutoSleepEnabled = false;
-        powerMon->clearState(meshtastic_PowerMon_State_CPU_LightSleep);
-        statusLEDModule->setPowerLED(true);
+    if (lsAutoSleepEnabled) {
+        const bool autoSleepStopped = stopAutoLightSleep();
+        if (!autoSleepStopped) {
+            LOG_ERROR("Unable to stop PM dynamic light sleep");
+        } else {
+            lsAutoSleepEnabled = false;
+            powerMon->clearState(meshtastic_PowerMon_State_CPU_LightSleep);
+            statusLEDModule->setPowerLED(true);
+        }
     }
 #endif
     // Lift the light-sleep force-off gate when leaving LS.

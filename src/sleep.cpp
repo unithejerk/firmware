@@ -25,12 +25,16 @@
 #endif
 #include "concurrency/Lock.h"
 #if HAS_ESP32_DYNAMIC_LIGHT_SLEEP
+#include <atomic>
 #include <freertos/portmacro.h>
 #endif
 #include "rom/rtc.h"
 #include <RadioLib.h>
 #include <driver/rtc_io.h>
 #include <driver/uart.h>
+#if HAS_ESP32_DYNAMIC_LIGHT_SLEEP
+#include <hal/rtc_io_hal.h>
+#endif
 
 esp_sleep_source_t wakeCause; // the reason we booted this time
 #endif
@@ -70,6 +74,7 @@ Observable<esp_sleep_wakeup_cause_t> notifyLightSleepEnd;
 static bool dynamicLightSleepReady;
 static portMUX_TYPE autoLightSleepWakeMux = portMUX_INITIALIZER_UNLOCKED;
 static bool autoLightSleepButtonWakePending;
+static std::atomic<bool> autoLightSleepLoraWakeConfigured{false};
 #endif
 #endif
 
@@ -446,47 +451,79 @@ static concurrency::Lock *lightSleepLock;
 // which holds the deep-sleep/reset boot reason and is read at render time (Screen.cpp).
 static esp_sleep_wakeup_cause_t lightSleepWakeCause;
 
+#ifdef BUTTON_PIN
+#ifndef BUTTON_ACTIVE_LOW
+#define BUTTON_ACTIVE_LOW true
+#endif
+#endif
+#ifdef CANCEL_BUTTON_PIN
+#ifndef CANCEL_BUTTON_ACTIVE_LOW
+#define CANCEL_BUTTON_ACTIVE_LOW true
+#endif
+#endif
+#ifdef DOWN_BUTTON_PIN
+#ifndef DOWN_BUTTON_ACTIVE_LOW
+#define DOWN_BUTTON_ACTIVE_LOW true
+#endif
+#endif
+
+static bool IRAM_ATTR inputLevelActive(gpio_num_t pin, bool activeLow)
+{
+    return GPIO_IS_VALID_GPIO(pin) && (gpio_get_level(pin) == (activeLow ? 0 : 1));
+}
+
 static bool IRAM_ATTR autoLightSleepInputLevelActive()
 {
 #ifdef BUTTON_PIN
-    if (GPIO_IS_VALID_GPIO((gpio_num_t)(config.device.button_gpio ? config.device.button_gpio : BUTTON_PIN)) &&
-        gpio_get_level((gpio_num_t)(config.device.button_gpio ? config.device.button_gpio : BUTTON_PIN)) == 0)
+    if (inputLevelActive((gpio_num_t)(config.device.button_gpio ? config.device.button_gpio : BUTTON_PIN), BUTTON_ACTIVE_LOW))
+        return true;
+#endif
+#ifdef ALT_BUTTON_PIN
+    if (inputLevelActive((gpio_num_t)ALT_BUTTON_PIN, ALT_BUTTON_ACTIVE_LOW))
+        return true;
+#endif
+#ifdef CANCEL_BUTTON_PIN
+    if (inputLevelActive((gpio_num_t)CANCEL_BUTTON_PIN, CANCEL_BUTTON_ACTIVE_LOW))
+        return true;
+#endif
+#ifdef DOWN_BUTTON_PIN
+    if (inputLevelActive((gpio_num_t)DOWN_BUTTON_PIN, DOWN_BUTTON_ACTIVE_LOW))
         return true;
 #endif
 #ifdef ROTARY_PRESS
-    if (GPIO_IS_VALID_GPIO((gpio_num_t)ROTARY_PRESS) && gpio_get_level((gpio_num_t)ROTARY_PRESS) == 0)
+    if (inputLevelActive((gpio_num_t)ROTARY_PRESS, true))
         return true;
 #endif
 #ifdef KB_INT
 #if KB_INT_WAKE_ON_HIGH
-    if (GPIO_IS_VALID_GPIO((gpio_num_t)KB_INT) && gpio_get_level((gpio_num_t)KB_INT) != 0)
+    if (inputLevelActive((gpio_num_t)KB_INT, false))
         return true;
 #else
-    if (GPIO_IS_VALID_GPIO((gpio_num_t)KB_INT) && gpio_get_level((gpio_num_t)KB_INT) == 0)
+    if (inputLevelActive((gpio_num_t)KB_INT, true))
         return true;
 #endif
 #endif
 #ifdef BOARD_PCA9535_INT
-    if (GPIO_IS_VALID_GPIO((gpio_num_t)BOARD_PCA9535_INT) && gpio_get_level((gpio_num_t)BOARD_PCA9535_INT) == 0)
+    if (inputLevelActive((gpio_num_t)BOARD_PCA9535_INT, true))
         return true;
 #endif
 #if defined(WAKE_ON_TOUCH) && defined(SCREEN_TOUCH_INT)
-    if (GPIO_IS_VALID_GPIO((gpio_num_t)SCREEN_TOUCH_INT) && gpio_get_level((gpio_num_t)SCREEN_TOUCH_INT) == 0)
+    if (inputLevelActive((gpio_num_t)SCREEN_TOUCH_INT, true))
         return true;
 #endif
 #if defined(INPUTDRIVER_TWO_WAY_ROCKER_BTN)
-    if (GPIO_IS_VALID_GPIO((gpio_num_t)INPUTDRIVER_TWO_WAY_ROCKER_BTN) &&
-        gpio_get_level((gpio_num_t)INPUTDRIVER_TWO_WAY_ROCKER_BTN) == 0)
+    if (inputLevelActive((gpio_num_t)INPUTDRIVER_TWO_WAY_ROCKER_BTN, true))
         return true;
 #elif defined(INPUTDRIVER_ENCODER_BTN)
-    if (GPIO_IS_VALID_GPIO((gpio_num_t)INPUTDRIVER_ENCODER_BTN) && gpio_get_level((gpio_num_t)INPUTDRIVER_ENCODER_BTN) == 0)
+    if (inputLevelActive((gpio_num_t)INPUTDRIVER_ENCODER_BTN, true))
         return true;
 #endif
     return false;
 }
 
 /// Tear down everything enableButtonInterrupt()/enableLoraInterrupt() armed.
-static void disableWakeInterrupts();
+static void disableWakeInterrupts(bool gpioWakeArmed);
+static void configureLoraSleepHardware();
 
 /**
  * enter light sleep (preserves ram but stops everything about CPU) for msecToWake ms.
@@ -498,7 +535,7 @@ static void disableWakeInterrupts();
 esp_sleep_wakeup_cause_t doLightSleep(uint32_t msecToWake)
 {
     if (!lightSleepLock)
-        return lightSleepWakeCause;
+        return ESP_SLEEP_WAKEUP_UNDEFINED;
     lightSleepLock->lock();
 
     // LORA_DIO1 is an extended IO pin (on an I/O expander). Setting it as a wake-up pin will cause problems,
@@ -541,7 +578,7 @@ esp_sleep_wakeup_cause_t doLightSleep(uint32_t msecToWake)
     }
     // Tear down everything armed above so the PM auto path does not fire on stale sources.
     esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
-    disableWakeInterrupts();
+    disableWakeInterrupts(true);
 
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
     notifyLightSleepEnd.notifyObservers(cause); // Button interrupts are reattached here
@@ -574,14 +611,71 @@ static void IRAM_ATTR recordAutoLightSleepButtonWake()
     portEXIT_CRITICAL_SAFE(&autoLightSleepWakeMux);
 }
 
-static esp_err_t IRAM_ATTR autoLightSleepExit(int64_t sleepTimeUsec, void *unused)
+static bool autoLightSleepLoraWakePin(gpio_num_t &pin)
 {
-    (void)sleepTimeUsec;
-    (void)unused;
-    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_GPIO) {
-        if (autoLightSleepInputLevelActive())
-            recordAutoLightSleepButtonWake();
+#if SOC_PM_SUPPORT_EXT1_WAKEUP && SOC_RTCIO_PIN_COUNT > 0
+#if defined(LORA_DIO1) && (LORA_DIO1 != RADIOLIB_NC) && !defined(LORA_DIO1_EXTENDED_IO)
+    if (radioType != RF95_RADIO) {
+        pin = (gpio_num_t)LORA_DIO1;
+        return esp_sleep_is_valid_wakeup_gpio(pin);
     }
+#endif
+#if defined(RF95_IRQ) && (RF95_IRQ != RADIOLIB_NC)
+    if (radioType == RF95_RADIO) {
+        pin = (gpio_num_t)RF95_IRQ;
+        return esp_sleep_is_valid_wakeup_gpio(pin);
+    }
+#endif
+#else
+    (void)pin;
+#endif
+    return false;
+}
+
+static esp_err_t autoLightSleepArmLoraWake()
+{
+#if SOC_PM_SUPPORT_EXT1_WAKEUP && SOC_RTCIO_PIN_COUNT > 0
+    gpio_num_t pin;
+    if (!autoLightSleepLoraWakePin(pin))
+        return ESP_ERR_NOT_SUPPORTED;
+
+    configureLoraSleepHardware();
+    esp_err_t res = esp_sleep_enable_ext1_wakeup_io(1ULL << (uint32_t)pin, ESP_EXT1_WAKEUP_ANY_HIGH);
+    if (res == ESP_OK)
+        autoLightSleepLoraWakeConfigured.store(true, std::memory_order_release);
+    return res;
+#else
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+static void autoLightSleepRestoreLoraWakePin()
+{
+#if SOC_PM_SUPPORT_EXT1_WAKEUP && SOC_RTCIO_PIN_COUNT > 0
+    if (autoLightSleepLoraWakeConfigured.load(std::memory_order_acquire)) {
+        gpio_num_t pin;
+        if (autoLightSleepLoraWakePin(pin)) {
+#if SOC_RTCIO_HOLD_SUPPORTED
+            rtcio_hal_hold_disable(rtc_io_number_get(pin));
+#endif
+            rtcio_hal_function_select(rtc_io_number_get(pin), RTCIO_LL_FUNC_DIGITAL);
+        }
+    }
+#endif
+}
+
+static esp_err_t autoLightSleepExit(int64_t sleepTimeUsec, void *unused)
+{
+    (void)unused;
+
+    if (sleepTimeUsec <= 0)
+        return ESP_OK; // PM invokes exit callbacks even when an entry was vetoed: nothing was remuxed
+
+    autoLightSleepRestoreLoraWakePin();
+
+    const esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    if ((cause == ESP_SLEEP_WAKEUP_GPIO || cause == ESP_SLEEP_WAKEUP_EXT1) && autoLightSleepInputLevelActive())
+        recordAutoLightSleepButtonWake();
     return ESP_OK;
 }
 
@@ -604,13 +698,23 @@ bool startAutoLightSleep()
         // First opt-in after init or a prior stopAutoLightSleep(): arm wake sources for
         // the PM auto path (not torn down by us afterward - esp_pm owns sleeping).
         notifyLightSleep.notifyObservers(NULL);
-        enableLoraInterrupt();
         enableButtonInterrupt();
         auto res = esp_sleep_enable_gpio_wakeup();
         if (res != ESP_OK) {
             LOG_ERROR("esp_sleep_enable_gpio_wakeup result %d", res);
-            esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
-            disableWakeInterrupts();
+            esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+            disableWakeInterrupts(false);
+            notifyLightSleepEnd.notifyObservers(esp_sleep_get_wakeup_cause());
+            dynamicLightSleepReady = false;
+            lightSleepLock->unlock();
+            return false;
+        }
+        res = autoLightSleepArmLoraWake();
+        if (res != ESP_OK) {
+            LOG_ERROR("LoRa EXT1 wake setup result %d", res);
+            esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+            autoLightSleepLoraWakeConfigured.store(false, std::memory_order_release);
+            disableWakeInterrupts(false);
             notifyLightSleepEnd.notifyObservers(esp_sleep_get_wakeup_cause());
             dynamicLightSleepReady = false;
             lightSleepLock->unlock();
@@ -619,8 +723,10 @@ bool startAutoLightSleep()
         res = esp_pm_lock_release(pmLightSleepLock);
         if (res != ESP_OK) {
             LOG_ERROR("esp_pm_lock_release(meshtastic) result %d", res);
-            esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
-            disableWakeInterrupts();
+            esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+            autoLightSleepRestoreLoraWakePin();
+            autoLightSleepLoraWakeConfigured.store(false, std::memory_order_release);
+            disableWakeInterrupts(false);
             notifyLightSleepEnd.notifyObservers(esp_sleep_get_wakeup_cause());
             dynamicLightSleepReady = false;
             lightSleepLock->unlock();
@@ -647,10 +753,12 @@ bool stopAutoLightSleep()
             return false;
         }
         pmLightSleepLockHeld = true;
-        res = esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
+        res = esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
         if (res != ESP_OK)
-            LOG_ERROR("esp_sleep_disable_wakeup_source(GPIO) result %d", res);
-        disableWakeInterrupts();
+            LOG_ERROR("esp_sleep_disable_wakeup_source(ALL) result %d", res);
+        autoLightSleepRestoreLoraWakePin();
+        autoLightSleepLoraWakeConfigured.store(false, std::memory_order_release);
+        disableWakeInterrupts(false);
         notifyLightSleepEnd.notifyObservers(esp_sleep_get_wakeup_cause());
         clearAutoLightSleepButtonWake();
         LOG_INFO("PM dynamic light sleep disabled");
@@ -683,12 +791,21 @@ void initLightSleep()
 #if HAS_ESP32_PM_SUPPORT
 #if HAS_ESP32_DYNAMIC_LIGHT_SLEEP
     dynamicLightSleepReady = false;
+    autoLightSleepLoraWakeConfigured.store(false, std::memory_order_release);
     clearAutoLightSleepButtonWake();
 #endif
+#if HAS_WIFI && !defined(MESHTASTIC_EXCLUDE_WIFI)
     // Prepare PM only for roles/settings that can request PowerFSM light sleep.
-    const bool autoSleepCandidate =
+    const bool powerSavingCandidate =
         config.power.is_power_saving || IS_ONE_OF(config.device.role, meshtastic_Config_DeviceConfig_Role_ROUTER,
                                                   meshtastic_Config_DeviceConfig_Role_ROUTER_LATE);
+    const bool isTrackerOrSensor =
+        IS_ONE_OF(config.device.role, meshtastic_Config_DeviceConfig_Role_TRACKER,
+                  meshtastic_Config_DeviceConfig_Role_TAK_TRACKER, meshtastic_Config_DeviceConfig_Role_SENSOR);
+    const bool autoSleepCandidate = powerSavingCandidate && !isWifiAvailable() && !isTrackerOrSensor;
+#else
+    const bool autoSleepCandidate = false;
+#endif
 
     if (autoSleepCandidate) {
         esp_err_t lockResult = esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "meshtastic", &pmLightSleepLock);
@@ -706,8 +823,7 @@ void initLightSleep()
         }
     }
 
-    // While a USB-CDC host link is live, SerialConsole holds the "usbcdc" NO_LIGHT_SLEEP
-    // lock so PM can't drop CDC RX bytes; IDF's USJ connection monitor holds its own
+    // IDF's USB Serial JTAG connection monitor holds its own NO_LIGHT_SLEEP lock
     // ("usb_serial_jtag") under CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION.
 
     static esp_pm_config_t esp32_config; // filled with zeros because bss
@@ -742,6 +858,11 @@ void initLightSleep()
              esp32_config.light_sleep_enable, rv);
 #if HAS_ESP32_DYNAMIC_LIGHT_SLEEP
     dynamicLightSleepReady = (rv == ESP_OK) && esp32_config.light_sleep_enable;
+    gpio_num_t loraWakePin;
+    if (dynamicLightSleepReady && !autoLightSleepLoraWakePin(loraWakePin)) {
+        LOG_ERROR("PM dynamic light sleep requires an RTC-capable LoRa wake pin");
+        dynamicLightSleepReady = false;
+    }
     if (dynamicLightSleepReady) {
         static esp_pm_sleep_cbs_register_config_t sleepCallbacks = {};
         sleepCallbacks.exit_cb = autoLightSleepExit;
@@ -763,13 +884,6 @@ bool isDynamicLightSleepReady()
 #else
     return false;
 #endif
-}
-
-bool didWakeFromAutoLightSleepInput(esp_sleep_wakeup_cause_t cause)
-{
-    if (cause != ESP_SLEEP_WAKEUP_GPIO)
-        return false;
-    return autoLightSleepInputLevelActive();
 }
 
 bool shouldLoraWake(uint32_t msecToWake)
@@ -799,7 +913,16 @@ void enableButtonInterrupt()
 #if defined(BUTTON_NEED_PULLUP)
     gpio_pullup_en(pin);
 #endif
-    gpio_wakeup_enable(pin, GPIO_INTR_LOW_LEVEL);
+    gpio_wakeup_enable(pin, BUTTON_ACTIVE_LOW ? GPIO_INTR_LOW_LEVEL : GPIO_INTR_HIGH_LEVEL);
+#endif
+#if defined(ALT_BUTTON_PIN)
+    gpio_wakeup_enable((gpio_num_t)ALT_BUTTON_PIN, ALT_BUTTON_ACTIVE_LOW ? GPIO_INTR_LOW_LEVEL : GPIO_INTR_HIGH_LEVEL);
+#endif
+#if defined(CANCEL_BUTTON_PIN)
+    gpio_wakeup_enable((gpio_num_t)CANCEL_BUTTON_PIN, CANCEL_BUTTON_ACTIVE_LOW ? GPIO_INTR_LOW_LEVEL : GPIO_INTR_HIGH_LEVEL);
+#endif
+#if defined(DOWN_BUTTON_PIN)
+    gpio_wakeup_enable((gpio_num_t)DOWN_BUTTON_PIN, DOWN_BUTTON_ACTIVE_LOW ? GPIO_INTR_LOW_LEVEL : GPIO_INTR_HIGH_LEVEL);
 #endif
 #if defined(ROTARY_PRESS)
     gpio_wakeup_enable((gpio_num_t)ROTARY_PRESS, GPIO_INTR_LOW_LEVEL);
@@ -828,12 +951,21 @@ void enableButtonInterrupt()
 #endif
 }
 
-/// Tear down everything enableButtonInterrupt()/enableLoraInterrupt() armed.
-static void disableWakeInterrupts()
+// Restore the radio interrupt type only if GPIO wake changed it to level-triggered.
+static void disableWakeInterrupts(bool gpioWakeArmed)
 {
 #if defined(BUTTON_PIN)
     gpio_num_t buttonPin = (gpio_num_t)(config.device.button_gpio ? config.device.button_gpio : BUTTON_PIN);
     gpio_wakeup_disable(buttonPin);
+#endif
+#if defined(ALT_BUTTON_PIN)
+    gpio_wakeup_disable((gpio_num_t)ALT_BUTTON_PIN);
+#endif
+#if defined(CANCEL_BUTTON_PIN)
+    gpio_wakeup_disable((gpio_num_t)CANCEL_BUTTON_PIN);
+#endif
+#if defined(DOWN_BUTTON_PIN)
+    gpio_wakeup_disable((gpio_num_t)DOWN_BUTTON_PIN);
 #endif
 #if defined(ROTARY_PRESS)
     gpio_wakeup_disable((gpio_num_t)ROTARY_PRESS);
@@ -857,7 +989,8 @@ static void disableWakeInterrupts()
 #if defined(LORA_DIO1) && (LORA_DIO1 != RADIOLIB_NC) && !defined(LORA_DIO1_EXTENDED_IO)
     if (radioType != RF95_RADIO) {
         gpio_wakeup_disable((gpio_num_t)LORA_DIO1);
-        gpio_set_intr_type((gpio_num_t)LORA_DIO1, GPIO_INTR_POSEDGE);
+        if (gpioWakeArmed)
+            gpio_set_intr_type((gpio_num_t)LORA_DIO1, GPIO_INTR_POSEDGE);
 #if SOC_PM_SUPPORT_EXT_WAKEUP
         // Undo the pull-down enableLoraInterrupt() armed; the radio drives DIO1
         // while awake and a latched pull-down can hold the last level.
@@ -868,7 +1001,8 @@ static void disableWakeInterrupts()
 #if defined(RF95_IRQ) && (RF95_IRQ != RADIOLIB_NC)
     if (radioType == RF95_RADIO) {
         gpio_wakeup_disable((gpio_num_t)RF95_IRQ);
-        gpio_set_intr_type((gpio_num_t)RF95_IRQ, GPIO_INTR_POSEDGE);
+        if (gpioWakeArmed)
+            gpio_set_intr_type((gpio_num_t)RF95_IRQ, GPIO_INTR_POSEDGE);
     }
 #endif
 #if HAS_LORA_FEM
@@ -876,13 +1010,10 @@ static void disableWakeInterrupts()
 #endif
 }
 
-void enableLoraInterrupt()
+static void configureLoraSleepHardware()
 {
-#if defined(LORA_DIO1_EXTENDED_IO)
-    // DIO1 is a virtual pin on an I/O expander - it cannot be a GPIO wakeup source
-#elif SOC_PM_SUPPORT_EXT_WAKEUP && defined(LORA_DIO1) && (LORA_DIO1 != RADIOLIB_NC)
-    esp_err_t res;
-    res = gpio_pulldown_en((gpio_num_t)LORA_DIO1);
+#if !defined(LORA_DIO1_EXTENDED_IO) && SOC_PM_SUPPORT_EXT_WAKEUP && defined(LORA_DIO1) && (LORA_DIO1 != RADIOLIB_NC)
+    esp_err_t res = gpio_pulldown_en((gpio_num_t)LORA_DIO1);
     if (res != ESP_OK) {
         LOG_ERROR("gpio_pulldown_en(LORA_DIO1) result %d", res);
     }
@@ -899,6 +1030,15 @@ void enableLoraInterrupt()
 #if HAS_LORA_FEM
     loraFEMInterface.setRxModeEnableWhenMCUSleep();
 #endif
+#endif
+}
+
+void enableLoraInterrupt()
+{
+#if defined(LORA_DIO1_EXTENDED_IO)
+    // DIO1 is a virtual pin on an I/O expander - it cannot be a GPIO wakeup source
+#elif SOC_PM_SUPPORT_EXT_WAKEUP && defined(LORA_DIO1) && (LORA_DIO1 != RADIOLIB_NC)
+    configureLoraSleepHardware();
 
     LOG_INFO("Wake on LORA_DIO1 (GPIO%02d) gpio interrupt", LORA_DIO1);
     gpio_wakeup_enable((gpio_num_t)LORA_DIO1, GPIO_INTR_HIGH_LEVEL);
@@ -915,5 +1055,27 @@ void enableLoraInterrupt()
         gpio_wakeup_enable((gpio_num_t)RF95_IRQ, GPIO_INTR_HIGH_LEVEL); // RF95 interrupt, active high
     }
 #endif
+}
+#endif
+
+#ifndef ARCH_ESP32
+bool startAutoLightSleep()
+{
+    return false;
+}
+
+bool stopAutoLightSleep()
+{
+    return true;
+}
+
+bool consumeAutoLightSleepButtonWake()
+{
+    return false;
+}
+
+bool isDynamicLightSleepReady()
+{
+    return false;
 }
 #endif

@@ -143,6 +143,14 @@ void test_gps_allows_light_sleep_when_inactive()
     TEST_ASSERT_TRUE(doPreflightSleep(false));
 }
 
+void test_native_auto_sleep_api_is_unavailable_without_esp32_pm()
+{
+    TEST_ASSERT_FALSE(isDynamicLightSleepReady());
+    TEST_ASSERT_FALSE(startAutoLightSleep());
+    TEST_ASSERT_TRUE(stopAutoLightSleep());
+    TEST_ASSERT_FALSE(consumeAutoLightSleepButtonWake());
+}
+
 void setup()
 {
     initializeTestEnvironment();
@@ -157,6 +165,7 @@ void setup()
     RUN_TEST(test_gps_allows_light_sleep_when_disabled);
     RUN_TEST(test_gps_allows_light_sleep_when_mode_is_disabled);
     RUN_TEST(test_gps_allows_light_sleep_when_inactive);
+    RUN_TEST(test_native_auto_sleep_api_is_unavailable_without_esp32_pm);
     exit(UNITY_END());
 }
 
