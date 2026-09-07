@@ -18,12 +18,13 @@
 #include "sleep.h"
 #include "target_specific.h"
 
-#ifdef ARCH_ESP32
-#include "esp_pm.h"
 #if HAS_WIFI
 #include "mesh/wifi/WiFiAPClient.h"
 #endif
+
+#ifdef ARCH_ESP32
 #include "concurrency/Lock.h"
+#include "esp_pm.h"
 #if HAS_ESP32_DYNAMIC_LIGHT_SLEEP
 #include <atomic>
 #include <freertos/portmacro.h>
@@ -63,6 +64,22 @@ Observable<void *> notifyDeepSleep;
 /// Called to tell observers we are rebooting ASAP.  Must return 0
 Observable<void *> notifyReboot;
 
+/// True when the current role/config make PowerFSM's stateLS reachable at all. See sleep.h.
+bool isAutoLightSleepEligible()
+{
+#if defined(ARCH_ESP32) && HAS_WIFI && !defined(MESHTASTIC_EXCLUDE_WIFI)
+    const bool powerSavingCandidate =
+        config.power.is_power_saving || IS_ONE_OF(config.device.role, meshtastic_Config_DeviceConfig_Role_ROUTER,
+                                                  meshtastic_Config_DeviceConfig_Role_ROUTER_LATE);
+    const bool isTrackerOrSensor =
+        IS_ONE_OF(config.device.role, meshtastic_Config_DeviceConfig_Role_TRACKER,
+                  meshtastic_Config_DeviceConfig_Role_TAK_TRACKER, meshtastic_Config_DeviceConfig_Role_SENSOR);
+    return powerSavingCandidate && !isWifiAvailable() && !isTrackerOrSensor;
+#else
+    return false;
+#endif
+}
+
 #ifdef ARCH_ESP32
 /// Called to tell observers that light sleep is about to begin
 Observable<void *> notifyLightSleep;
@@ -71,10 +88,17 @@ Observable<void *> notifyLightSleep;
 Observable<esp_sleep_wakeup_cause_t> notifyLightSleepEnd;
 
 #if HAS_ESP32_DYNAMIC_LIGHT_SLEEP
-static bool dynamicLightSleepReady;
+static bool dynamicLightSleepReady;        // capability, decided once in initLightSleep()
+static uint8_t autoLightSleepFailureCount; // bounded runtime-retry counter; see isAutoLightSleepAvailable()
+static constexpr uint8_t MAX_AUTO_LIGHT_SLEEP_FAILURES = 3;
 static portMUX_TYPE autoLightSleepWakeMux = portMUX_INITIALIZER_UNLOCKED;
-static bool autoLightSleepButtonWakePending;
+static bool autoLightSleepButtonWakePending; // GPIO wake w/ active input; drives the stop/reattach cycle
+static esp_sleep_wakeup_cause_t autoLightSleepLastWakeCause = ESP_SLEEP_WAKEUP_UNDEFINED;
 static std::atomic<bool> autoLightSleepLoraWakeConfigured{false};
+static std::atomic<bool> autoLightSleepPowerServicePending{
+    false}; // GPIO or EXT1 wake; see consumeAutoLightSleepPowerServiceWake()
+static gpio_num_t autoLightSleepLoraWakePinCached;
+static bool autoLightSleepLoraWakePinValid;
 #endif
 #endif
 
@@ -601,13 +625,17 @@ static void IRAM_ATTR clearAutoLightSleepButtonWake()
 {
     portENTER_CRITICAL_SAFE(&autoLightSleepWakeMux);
     autoLightSleepButtonWakePending = false;
+    autoLightSleepLastWakeCause = ESP_SLEEP_WAKEUP_UNDEFINED;
     portEXIT_CRITICAL_SAFE(&autoLightSleepWakeMux);
 }
 
-static void IRAM_ATTR recordAutoLightSleepButtonWake()
+// Record each wake cause and latch active GPIO input separately from EXT1 radio wakes.
+static void IRAM_ATTR recordAutoLightSleepWake(esp_sleep_wakeup_cause_t cause, bool buttonWake)
 {
     portENTER_CRITICAL_SAFE(&autoLightSleepWakeMux);
-    autoLightSleepButtonWakePending = true;
+    autoLightSleepLastWakeCause = cause;
+    if (buttonWake)
+        autoLightSleepButtonWakePending = true;
     portEXIT_CRITICAL_SAFE(&autoLightSleepWakeMux);
 }
 
@@ -635,12 +663,11 @@ static bool autoLightSleepLoraWakePin(gpio_num_t &pin)
 static esp_err_t autoLightSleepArmLoraWake()
 {
 #if SOC_PM_SUPPORT_EXT1_WAKEUP && SOC_RTCIO_PIN_COUNT > 0
-    gpio_num_t pin;
-    if (!autoLightSleepLoraWakePin(pin))
+    if (!autoLightSleepLoraWakePinValid)
         return ESP_ERR_NOT_SUPPORTED;
 
     configureLoraSleepHardware();
-    esp_err_t res = esp_sleep_enable_ext1_wakeup_io(1ULL << (uint32_t)pin, ESP_EXT1_WAKEUP_ANY_HIGH);
+    esp_err_t res = esp_sleep_enable_ext1_wakeup_io(1ULL << (uint32_t)autoLightSleepLoraWakePinCached, ESP_EXT1_WAKEUP_ANY_HIGH);
     if (res == ESP_OK)
         autoLightSleepLoraWakeConfigured.store(true, std::memory_order_release);
     return res;
@@ -649,22 +676,22 @@ static esp_err_t autoLightSleepArmLoraWake()
 #endif
 }
 
-static void autoLightSleepRestoreLoraWakePin()
+// Restore the cached LoRa pin from RTC to digital mode in the PM exit callback.
+static void IRAM_ATTR autoLightSleepRestoreLoraWakePin()
 {
 #if SOC_PM_SUPPORT_EXT1_WAKEUP && SOC_RTCIO_PIN_COUNT > 0
-    if (autoLightSleepLoraWakeConfigured.load(std::memory_order_acquire)) {
-        gpio_num_t pin;
-        if (autoLightSleepLoraWakePin(pin)) {
+    if (autoLightSleepLoraWakeConfigured.load(std::memory_order_acquire) && autoLightSleepLoraWakePinValid) {
 #if SOC_RTCIO_HOLD_SUPPORTED
-            rtcio_hal_hold_disable(rtc_io_number_get(pin));
+        rtcio_hal_hold_disable(rtc_io_number_get(autoLightSleepLoraWakePinCached));
 #endif
-            rtcio_hal_function_select(rtc_io_number_get(pin), RTCIO_LL_FUNC_DIGITAL);
-        }
+        rtcio_hal_function_select(rtc_io_number_get(autoLightSleepLoraWakePinCached), RTCIO_LL_FUNC_DIGITAL);
     }
 #endif
 }
 
-static esp_err_t autoLightSleepExit(int64_t sleepTimeUsec, void *unused)
+// IRAM: registered as esp_pm's light-sleep exit callback, invoked from vApplicationSleep() inside
+// portENTER_CRITICAL(&s_switch_lock) with interrupts disabled, on every light-sleep exit.
+static esp_err_t IRAM_ATTR autoLightSleepExit(int64_t sleepTimeUsec, void *unused)
 {
     (void)unused;
 
@@ -673,9 +700,14 @@ static esp_err_t autoLightSleepExit(int64_t sleepTimeUsec, void *unused)
 
     autoLightSleepRestoreLoraWakePin();
 
+    // PM invokes this after esp_light_sleep_start() restores the flash cache.
     const esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-    if ((cause == ESP_SLEEP_WAKEUP_GPIO || cause == ESP_SLEEP_WAKEUP_EXT1) && autoLightSleepInputLevelActive())
-        recordAutoLightSleepButtonWake();
+    recordAutoLightSleepWake(cause, cause == ESP_SLEEP_WAKEUP_GPIO && autoLightSleepInputLevelActive());
+
+    // Defer power servicing because power and runASAP are unsafe in this callback.
+    if (cause == ESP_SLEEP_WAKEUP_GPIO || cause == ESP_SLEEP_WAKEUP_EXT1)
+        autoLightSleepPowerServicePending.store(true, std::memory_order_release);
+
     return ESP_OK;
 }
 
@@ -688,13 +720,20 @@ bool consumeAutoLightSleepButtonWake()
     return pending;
 }
 
+bool consumeAutoLightSleepPowerServiceWake()
+{
+    return autoLightSleepPowerServicePending.exchange(false, std::memory_order_acq_rel);
+}
+
 bool startAutoLightSleep()
 {
-    if (!lightSleepLock || !pmLightSleepLock || !dynamicLightSleepReady)
+    if (!lightSleepLock || !pmLightSleepLock || !dynamicLightSleepReady ||
+        autoLightSleepFailureCount >= MAX_AUTO_LIGHT_SLEEP_FAILURES)
         return false;
     lightSleepLock->lock();
     if (pmLightSleepLockHeld) {
         clearAutoLightSleepButtonWake();
+        autoLightSleepPowerServicePending.store(false, std::memory_order_release);
         // First opt-in after init or a prior stopAutoLightSleep(): arm wake sources for
         // the PM auto path (not torn down by us afterward - esp_pm owns sleeping).
         notifyLightSleep.notifyObservers(NULL);
@@ -704,8 +743,8 @@ bool startAutoLightSleep()
             LOG_ERROR("esp_sleep_enable_gpio_wakeup result %d", res);
             esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
             disableWakeInterrupts(false);
-            notifyLightSleepEnd.notifyObservers(esp_sleep_get_wakeup_cause());
-            dynamicLightSleepReady = false;
+            notifyLightSleepEnd.notifyObservers(ESP_SLEEP_WAKEUP_UNDEFINED); // no sleep happened
+            autoLightSleepFailureCount++;
             lightSleepLock->unlock();
             return false;
         }
@@ -715,8 +754,8 @@ bool startAutoLightSleep()
             esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
             autoLightSleepLoraWakeConfigured.store(false, std::memory_order_release);
             disableWakeInterrupts(false);
-            notifyLightSleepEnd.notifyObservers(esp_sleep_get_wakeup_cause());
-            dynamicLightSleepReady = false;
+            notifyLightSleepEnd.notifyObservers(ESP_SLEEP_WAKEUP_UNDEFINED); // no sleep happened
+            autoLightSleepFailureCount++;
             lightSleepLock->unlock();
             return false;
         }
@@ -727,12 +766,13 @@ bool startAutoLightSleep()
             autoLightSleepRestoreLoraWakePin();
             autoLightSleepLoraWakeConfigured.store(false, std::memory_order_release);
             disableWakeInterrupts(false);
-            notifyLightSleepEnd.notifyObservers(esp_sleep_get_wakeup_cause());
-            dynamicLightSleepReady = false;
+            notifyLightSleepEnd.notifyObservers(ESP_SLEEP_WAKEUP_UNDEFINED); // no sleep happened
+            autoLightSleepFailureCount++;
             lightSleepLock->unlock();
             return false;
         }
         pmLightSleepLockHeld = false;
+        autoLightSleepFailureCount = 0; // bounded-retry counter resets on success
         LOG_INFO("PM dynamic light sleep enabled");
     }
     lightSleepLock->unlock();
@@ -759,8 +799,15 @@ bool stopAutoLightSleep()
         autoLightSleepRestoreLoraWakePin();
         autoLightSleepLoraWakeConfigured.store(false, std::memory_order_release);
         disableWakeInterrupts(false);
-        notifyLightSleepEnd.notifyObservers(esp_sleep_get_wakeup_cause());
+
+        portENTER_CRITICAL_SAFE(&autoLightSleepWakeMux);
+        const esp_sleep_wakeup_cause_t lastWakeCause = autoLightSleepLastWakeCause;
+        autoLightSleepLastWakeCause = ESP_SLEEP_WAKEUP_UNDEFINED;
+        portEXIT_CRITICAL_SAFE(&autoLightSleepWakeMux);
+        notifyLightSleepEnd.notifyObservers(lastWakeCause); // cause of the sleep that actually woke us, if tracked
+
         clearAutoLightSleepButtonWake();
+        autoLightSleepPowerServicePending.store(false, std::memory_order_release);
         LOG_INFO("PM dynamic light sleep disabled");
     }
     lightSleepLock->unlock();
@@ -779,6 +826,10 @@ bool consumeAutoLightSleepButtonWake()
 {
     return false;
 }
+bool consumeAutoLightSleepPowerServiceWake()
+{
+    return false;
+}
 #endif
 
 void initLightSleep()
@@ -791,21 +842,15 @@ void initLightSleep()
 #if HAS_ESP32_PM_SUPPORT
 #if HAS_ESP32_DYNAMIC_LIGHT_SLEEP
     dynamicLightSleepReady = false;
+    autoLightSleepFailureCount = 0;
+    autoLightSleepLastWakeCause = ESP_SLEEP_WAKEUP_UNDEFINED;
+    autoLightSleepPowerServicePending.store(false, std::memory_order_release);
     autoLightSleepLoraWakeConfigured.store(false, std::memory_order_release);
     clearAutoLightSleepButtonWake();
 #endif
-#if HAS_WIFI && !defined(MESHTASTIC_EXCLUDE_WIFI)
-    // Prepare PM only for roles/settings that can request PowerFSM light sleep.
-    const bool powerSavingCandidate =
-        config.power.is_power_saving || IS_ONE_OF(config.device.role, meshtastic_Config_DeviceConfig_Role_ROUTER,
-                                                  meshtastic_Config_DeviceConfig_Role_ROUTER_LATE);
-    const bool isTrackerOrSensor =
-        IS_ONE_OF(config.device.role, meshtastic_Config_DeviceConfig_Role_TRACKER,
-                  meshtastic_Config_DeviceConfig_Role_TAK_TRACKER, meshtastic_Config_DeviceConfig_Role_SENSOR);
-    const bool autoSleepCandidate = powerSavingCandidate && !isWifiAvailable() && !isTrackerOrSensor;
-#else
-    const bool autoSleepCandidate = false;
-#endif
+    // Prepare PM only for roles/settings that can request PowerFSM light sleep. Shared with
+    // PowerFSM_setup() so the two can't disagree about when stateLS applies.
+    const bool autoSleepCandidate = isAutoLightSleepEligible();
 
     if (autoSleepCandidate) {
         esp_err_t lockResult = esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "meshtastic", &pmLightSleepLock);
@@ -858,8 +903,12 @@ void initLightSleep()
              esp32_config.light_sleep_enable, rv);
 #if HAS_ESP32_DYNAMIC_LIGHT_SLEEP
     dynamicLightSleepReady = (rv == ESP_OK) && esp32_config.light_sleep_enable;
+    // Resolve the LoRa wake pin once here and cache it, so the exit callback does not repeat the
+    // esp_sleep_is_valid_wakeup_gpio() lookup inside a critical section on every wake.
     gpio_num_t loraWakePin;
-    if (dynamicLightSleepReady && !autoLightSleepLoraWakePin(loraWakePin)) {
+    autoLightSleepLoraWakePinValid = autoLightSleepLoraWakePin(loraWakePin);
+    autoLightSleepLoraWakePinCached = autoLightSleepLoraWakePinValid ? loraWakePin : GPIO_NUM_NC;
+    if (dynamicLightSleepReady && !autoLightSleepLoraWakePinValid) {
         LOG_ERROR("PM dynamic light sleep requires an RTC-capable LoRa wake pin");
         dynamicLightSleepReady = false;
     }
@@ -881,6 +930,15 @@ bool isDynamicLightSleepReady()
 {
 #if HAS_ESP32_DYNAMIC_LIGHT_SLEEP
     return dynamicLightSleepReady;
+#else
+    return false;
+#endif
+}
+
+bool isAutoLightSleepAvailable()
+{
+#if HAS_ESP32_DYNAMIC_LIGHT_SLEEP
+    return dynamicLightSleepReady && autoLightSleepFailureCount < MAX_AUTO_LIGHT_SLEEP_FAILURES;
 #else
     return false;
 #endif
@@ -1074,7 +1132,17 @@ bool consumeAutoLightSleepButtonWake()
     return false;
 }
 
+bool consumeAutoLightSleepPowerServiceWake()
+{
+    return false;
+}
+
 bool isDynamicLightSleepReady()
+{
+    return false;
+}
+
+bool isAutoLightSleepAvailable()
 {
     return false;
 }

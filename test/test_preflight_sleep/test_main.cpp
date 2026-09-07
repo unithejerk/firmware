@@ -148,7 +148,10 @@ void test_native_auto_sleep_api_is_unavailable_without_esp32_pm()
     TEST_ASSERT_FALSE(isDynamicLightSleepReady());
     TEST_ASSERT_FALSE(startAutoLightSleep());
     TEST_ASSERT_TRUE(stopAutoLightSleep());
+    TEST_ASSERT_FALSE(isAutoLightSleepAvailable());
+    TEST_ASSERT_FALSE(isAutoLightSleepEligible());
     TEST_ASSERT_FALSE(consumeAutoLightSleepButtonWake());
+    TEST_ASSERT_FALSE(consumeAutoLightSleepPowerServiceWake());
 }
 
 void setup()

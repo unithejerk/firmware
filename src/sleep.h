@@ -14,11 +14,23 @@ bool startAutoLightSleep();
 /// CPU at min_freq but never auto-sleeps until startAutoLightSleep() again).
 bool stopAutoLightSleep();
 
-/// Consume a button GPIO wake recorded by the esp_pm light-sleep exit callback.
+/// Consume a pending GPIO wake (button/input) recorded by the esp_pm light-sleep exit
+/// callback. Never set for an EXT1 (LoRa) wake - see consumeAutoLightSleepPowerServiceWake().
 bool consumeAutoLightSleepButtonWake();
 
-/// Return true when automatic light sleep is configured and ready to use.
+/// Consume a pending "service power ASAP" flag recorded on a GPIO or EXT1 (LoRa) wake by the
+/// esp_pm light-sleep exit callback.
+bool consumeAutoLightSleepPowerServiceWake();
+
+/// Return true when automatic light sleep is a capability of this build/boot (decided once in
+/// initLightSleep()). Does not reflect bounded runtime failures - see isAutoLightSleepAvailable().
 bool isDynamicLightSleepReady();
+
+/// Return true while automatic light sleep is ready and its retry budget remains.
+bool isAutoLightSleepAvailable();
+
+/// Return true when the current role and configuration allow PowerFSM to enter stateLS.
+bool isAutoLightSleepEligible();
 
 #ifdef ARCH_ESP32
 #include "esp_sleep.h"

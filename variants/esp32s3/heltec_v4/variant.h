@@ -10,6 +10,7 @@
 
 #define USE_SX1262
 
+// Automatic light sleep requires the RTC-capable LORA_DIO1 on GPIO14.
 #define HAS_ESP32_DYNAMIC_LIGHT_SLEEP_CAPABILITY 1
 
 #define LORA_DIO0 -1 // a No connect on the SX1262 module

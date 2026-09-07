@@ -138,48 +138,70 @@ static void lsIdle()
     // LOG_INFO("lsIdle begin ls_secs=%u", getPref_ls_secs());
 
 #ifdef ARCH_ESP32
+    const uint32_t lsDurationMsec = Default::getConfiguredOrDefaultMs(config.power.ls_secs, default_ls_secs);
 
 #if HAS_ESP32_DYNAMIC_LIGHT_SLEEP
-    if (consumeAutoLightSleepButtonWake()) {
-        powerFSM.trigger(EVENT_PRESS);
-        return;
-    }
+    if (isAutoLightSleepAvailable()) {
+        if (consumeAutoLightSleepPowerServiceWake()) {
+            // Port of upstream PR #10230: a GPIO or EXT1 (LoRa) wake may need power serviced now.
+            power->setIntervalFromNow(0);
+            runASAP = true;
+        }
 
-    // Check the timeout before preflight so a persistent veto cannot keep us in LS.
-    const uint32_t lsDurationMsec = Default::getConfiguredOrDefaultMs(config.power.ls_secs, default_ls_secs);
-    if (Throttle::hasElapsed(lsIdleSinceMsec, lsDurationMsec)) {
-        LOG_INFO("Reached ls_secs, service loop()");
-        powerFSM.trigger(EVENT_WAKE_TIMER);
-        return;
-    }
-
-    if (!doPreflightSleep()) {
-        if (lsAutoSleepEnabled) {
-            if (stopAutoLightSleep()) {
+        if (consumeAutoLightSleepButtonWake()) {
+            // Stop automatic sleep so input handlers can reattach after a GPIO wake.
+            if (lsAutoSleepEnabled && stopAutoLightSleep()) {
                 lsAutoSleepEnabled = false;
                 powerMon->clearState(meshtastic_PowerMon_State_CPU_LightSleep);
                 statusLEDModule->setPowerLED(true);
             }
+            // Report the consumed wake press directly; InputBroker drops events while the screen is off.
+            powerFSM.trigger(EVENT_PRESS);
+            return;
+        }
+
+        // Check the timeout before preflight so a persistent veto cannot keep us in LS.
+        if (Throttle::hasElapsed(lsIdleSinceMsec, lsDurationMsec)) {
+            LOG_INFO("Reached ls_secs, service loop()");
+            powerFSM.trigger(EVENT_WAKE_TIMER);
+            return;
+        }
+
+        if (!doPreflightSleep()) {
+            if (lsAutoSleepEnabled) {
+                if (stopAutoLightSleep()) {
+                    lsAutoSleepEnabled = false;
+                    powerMon->clearState(meshtastic_PowerMon_State_CPU_LightSleep);
+                    statusLEDModule->setPowerLED(true);
+                }
+            }
+            return;
+        }
+
+        if (!lsAutoSleepEnabled) {
+            if (!startAutoLightSleep()) {
+                // startAutoLightSleep() records the failure itself (bounded retry); fall back to
+                // the legacy loop below once isAutoLightSleepAvailable() reflects that.
+                return;
+            }
+            powerMon->setState(meshtastic_PowerMon_State_CPU_LightSleep);
+            statusLEDModule->setPowerLED(false);
+            lsAutoSleepEnabled = true;
         }
         return;
     }
 
-    if (!lsAutoSleepEnabled) {
-        if (!isDynamicLightSleepReady()) {
-            powerFSM.trigger(EVENT_WAKE_TIMER);
-            return;
-        }
-        if (!startAutoLightSleep()) {
-            powerFSM.trigger(EVENT_WAKE_TIMER);
-            return;
-        }
-        powerMon->setState(meshtastic_PowerMon_State_CPU_LightSleep);
-        statusLEDModule->setPowerLED(false);
-        lsAutoSleepEnabled = true;
+    // Stop any active PM sleep before falling back to the explicit light-sleep loop.
+    if (lsAutoSleepEnabled) {
+        if (!stopAutoLightSleep())
+            return; // try again next pass rather than run both sleep paths at once
+        lsAutoSleepEnabled = false;
+        powerMon->clearState(meshtastic_PowerMon_State_CPU_LightSleep);
+        statusLEDModule->setPowerLED(true);
     }
-#else
+#endif
     // Do we have more sleeping to do?
-    if (secsSlept < config.power.ls_secs) {
+    if (static_cast<uint64_t>(secsSlept) * 1000ULL < lsDurationMsec) {
         // If some other service would stall sleep, don't let sleep happen yet
         if (doPreflightSleep()) {
             // Briefly come out of sleep long enough to blink the led once every few seconds
@@ -243,18 +265,21 @@ static void lsIdle()
         powerFSM.trigger(EVENT_WAKE_TIMER);
     }
 #endif
-#endif
 }
 
 static void lsExit()
 {
     LOG_POWERFSM("State: lsExit");
 #if defined(ARCH_ESP32) && HAS_ESP32_DYNAMIC_LIGHT_SLEEP
-    // Re-acquire the NO_LIGHT_SLEEP lock so PM stops auto-sleeping.
+    // Re-acquire the NO_LIGHT_SLEEP lock before leaving automatic light sleep.
     if (lsAutoSleepEnabled) {
-        const bool autoSleepStopped = stopAutoLightSleep();
-        if (!autoSleepStopped) {
+        if (!stopAutoLightSleep()) {
             LOG_ERROR("Unable to stop PM dynamic light sleep");
+            RECORD_CRITICALERROR(meshtastic_CriticalErrorCode_UNSPECIFIED);
+            if (rebootAtMsec == 0 && shutdownAtMsec == 0)
+                rebootAtMsec = millis() + 5000;
+            power->setIntervalFromNow(0);
+            runASAP = true;
         } else {
             lsAutoSleepEnabled = false;
             powerMon->clearState(meshtastic_PowerMon_State_CPU_LightSleep);
@@ -503,11 +528,8 @@ void PowerFSM_setup()
     // through the modules
 
 #if HAS_WIFI && !defined(MESHTASTIC_EXCLUDE_WIFI)
-    bool isTrackerOrSensor = config.device.role == meshtastic_Config_DeviceConfig_Role_TRACKER ||
-                             config.device.role == meshtastic_Config_DeviceConfig_Role_TAK_TRACKER ||
-                             config.device.role == meshtastic_Config_DeviceConfig_Role_SENSOR;
-
-    if ((isRouter || config.power.is_power_saving) && !isWifiAvailable() && !isTrackerOrSensor) {
+    // Shared with initLightSleep() so the two can't disagree about when stateLS applies.
+    if (isAutoLightSleepEligible()) {
         powerFSM.add_timed_transition(&stateNB, &stateLS,
                                       Default::getConfiguredOrDefaultMs(config.power.min_wake_secs, default_min_wake_secs), NULL,
                                       "Min wake timeout");
