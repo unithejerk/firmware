@@ -16,7 +16,12 @@
 #ifdef SERIAL_HAS_ON_RECEIVE
 #undef SERIAL_HAS_ON_RECEIVE
 #endif
+#if defined(ARDUINO_USB_MODE) && ARDUINO_USB_MODE && !defined(CONFIG_IDF_TARGET_ESP32S2)
+#define IS_USB_SERIAL_HWCDC
 #include "HWCDC.h"
+#else
+#include "USBCDC.h"
+#endif
 #endif
 
 #ifdef RP2040_SLOW_CLOCK
@@ -82,8 +87,13 @@ SerialConsole::SerialConsole() : StreamAPI(&Port), RedirectablePrint(&Port), con
 #endif
     Port.begin(SERIAL_BAUD);
 #ifdef IS_USB_SERIAL
+#ifdef IS_USB_SERIAL_HWCDC
     Port.onEvent(ARDUINO_HW_CDC_RX_EVENT, onConsoleCdcEvent);
     Port.onEvent(ARDUINO_HW_CDC_CONNECTED_EVENT, onConsoleCdcEvent);
+#else
+    Port.onEvent(ARDUINO_USB_CDC_RX_EVENT, onConsoleCdcEvent);
+    Port.onEvent(ARDUINO_USB_CDC_CONNECTED_EVENT, onConsoleCdcEvent);
+#endif
 #endif
     // Boot with console TX in non-blocking mode: no host is provably listening yet.
     setHostDraining(false);
@@ -142,8 +152,10 @@ int32_t SerialConsole::runOnce()
     if (hasPendingOutput())
         return delay < 25 ? delay : 25; // 0 continues a budget slice; else short-poll TX drain
     return Port.available() ? delay : INT32_MAX;
-#elif defined(IS_USB_SERIAL)
+#elif defined(IS_USB_SERIAL_HWCDC)
     return HWCDC::isPlugged() ? delay : (1000 * 20);
+#elif defined(IS_USB_SERIAL)
+    return static_cast<bool>(Port) ? delay : (1000 * 20);
 #else
     return delay;
 #endif
