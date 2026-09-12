@@ -135,12 +135,19 @@ void setCPUFast(bool on)
         if (!lockHeld) {
             if (!cpuFreqMaxLock && esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "cpu_fast", &cpuFreqMaxLock) != ESP_OK)
                 return;
-            esp_pm_lock_acquire(cpuFreqMaxLock);
+            esp_err_t result = esp_pm_lock_acquire(cpuFreqMaxLock);
+            if (result != ESP_OK) {
+                LOG_ERROR("esp_pm_lock_acquire(cpu_fast) result %d", result);
+                return;
+            }
             lockHeld = true;
         }
     } else if (lockHeld) {
-        esp_pm_lock_release(cpuFreqMaxLock);
-        lockHeld = false;
+        esp_err_t result = esp_pm_lock_release(cpuFreqMaxLock);
+        if (result == ESP_OK)
+            lockHeld = false;
+        else
+            LOG_ERROR("esp_pm_lock_release(cpu_fast) result %d", result);
     }
 #elif defined(ARCH_ESP32) && HAS_WIFI && !HAS_TFT && !defined(T_LORA_PAGER) && !defined(T_DECK)
 
@@ -1002,6 +1009,11 @@ void enableButtonInterrupt()
 #if defined(WAKE_ON_TOUCH)
     gpio_wakeup_enable((gpio_num_t)SCREEN_TOUCH_INT, GPIO_INTR_LOW_LEVEL);
 #endif
+#ifdef MOTION_WAKE_INT_PIN
+    if (config.display.wake_on_tap_or_motion)
+        gpio_wakeup_enable((gpio_num_t)MOTION_WAKE_INT_PIN,
+                           MOTION_WAKE_INT_ACTIVE_HIGH ? GPIO_INTR_HIGH_LEVEL : GPIO_INTR_LOW_LEVEL);
+#endif
 #ifdef PMU_IRQ
     // wake due to PMU can happen repeatedly if there is no battery installed or the battery fills
     if (pmu_found)
@@ -1039,6 +1051,9 @@ static void disableWakeInterrupts(bool gpioWakeArmed)
 #endif
 #if defined(WAKE_ON_TOUCH)
     gpio_wakeup_disable((gpio_num_t)SCREEN_TOUCH_INT);
+#endif
+#ifdef MOTION_WAKE_INT_PIN
+    gpio_wakeup_disable((gpio_num_t)MOTION_WAKE_INT_PIN);
 #endif
 #if defined(PMU_IRQ)
     if (pmu_found)
